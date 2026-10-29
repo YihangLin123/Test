@@ -1,0 +1,382 @@
+# -*- coding: utf-8 -*-
+"""
+高性能内控缺陷穿透识别模型 —— 优化版随机森林 + SMOTE 过采样 + SHAP 特征解释
+数据结构适配：
+  - 基础信息：证券代码、证券简称、year、行业代码
+  - 特征范围：E 列至 Y 列
+  - 标签列：Y1, Y2 (最后两列)
+"""
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from sklearn.ensemble import RandomForestClassifier
+from imblearn.over_sampling import SMOTE
+from sklearn.metrics import (
+    accuracy_score, precision_score, recall_score,
+    f1_score, roc_auc_score, average_precision_score, precision_recall_curve,
+    roc_curve
+)
+from sklearn.model_selection import train_test_split
+
+# 设置中文字体和负号正常显示
+plt.rcParams['font.sans-serif'] = ['SimHei']
+plt.rcParams['axes.unicode_minus'] = False
+
+# ============================================================
+# 全局配置
+# ============================================================
+FILE_NAME = './data/final_data.xlsx'
+TARGET_SYMBOL = '600251'          # 案例公司股票代码（绝不参与训练）
+TARGET_COL = 'Y2'                 # 监管铁证纠偏标签
+RANDOM_STATE = 42
+TEST_SIZE = 0.2
+
+# ============================================================
+# 第一步：读取数据 & 隔离案例公司
+# ============================================================
+df = pd.read_excel(FILE_NAME)
+print(f"原始总样本数: {df.shape[0]}, 总列数: {df.shape[1]}")
+
+# 统一股票代码列名为 'Symbol'
+code_col_candidates = ['证券代码', 'Symbol', 'Stkcd']
+code_col = next((c for c in code_col_candidates if c in df.columns), None)
+if not code_col:
+    raise ValueError(f"表格中未找到股票代码列，现有列名为: {list(df.columns)}")
+if code_col != 'Symbol':
+    df.rename(columns={code_col: 'Symbol'}, inplace=True)
+
+df['Symbol'] = df['Symbol'].astype(str).str.strip()
+
+# 统一标示年份列名为 'Year'
+year_col_candidates = ['year', 'Year']
+year_col = next((c for c in year_col_candidates if c in df.columns), None)
+if not year_col:
+    raise ValueError(f"表格中未找到年份列，现有列名为: {list(df.columns)}")
+if year_col != 'Year':
+    df.rename(columns={year_col: 'Year'}, inplace=True)
+df['Year'] = pd.to_numeric(df['Year'], errors='coerce')
+
+# ============================================================
+# 第二步：精准定位特征列（E 列到 Y 列）
+# ============================================================
+start_idx = 4   # E 列
+end_idx = 25    # Y 列的下一位（不含）
+
+raw_feature_cols = df.columns[start_idx:end_idx].tolist()
+print(f"成功锁定特征范围：从【{raw_feature_cols[0]}】(E列) 到【{raw_feature_cols[-1]}】(Y列)，共 {len(raw_feature_cols)} 个特征")
+
+# 1) 提取案例公司全部数据（独立保存，绝不参与训练）
+df_case = df[df['Symbol'] == TARGET_SYMBOL].copy()
+
+# 2) 构建候选训练池（彻底剔除案例公司）
+df_train_pool_raw = df[df['Symbol'] != TARGET_SYMBOL].copy()
+print(f"剔除案例公司 ({TARGET_SYMBOL}) 后的候选训练池样本数: {df_train_pool_raw.shape[0]}")
+
+# 强制将特征列转为数值型，过滤异常文本
+feature_cols = []
+for col in raw_feature_cols:
+    converted = pd.to_numeric(df_train_pool_raw[col], errors='coerce')
+    if converted.notna().sum() > 0:
+        df_train_pool_raw[col] = converted
+        if col in df_case.columns:
+            df_case[col] = pd.to_numeric(df_case[col], errors='coerce')
+        feature_cols.append(col)
+
+print(f"清洗后实际参与训练的有效数值特征数: {len(feature_cols)}")
+
+
+# ============================================================
+# 第三步：正样本全保留，负样本严格筛选（2017-2025 连续存在且 Y2 恒为 0）
+# ============================================================
+target_years = list(range(2017, 2026))
+print(f"\n正在筛选 2017-2025 连续合规的平衡面板负样本公司...")
+
+valid_neg_symbols = []
+for symbol, group in df_train_pool_raw.groupby('Symbol'):
+    company_years = set(group['Year'].astype(int))
+    if set(target_years).issubset(company_years):
+        sub_period = group[group['Year'].isin(target_years)]
+        if (sub_period[TARGET_COL] == 0).all():
+            valid_neg_symbols.append(symbol)
+
+print(f"• 筛选出的长期合规负样本公司总数: {len(valid_neg_symbols)} 家")
+
+df_neg = df_train_pool_raw[
+    df_train_pool_raw['Symbol'].isin(valid_neg_symbols) &
+    df_train_pool_raw['Year'].isin(target_years)
+].copy()
+
+df_pos = df_train_pool_raw[df_train_pool_raw[TARGET_COL] == 1].copy()
+
+print(f"最终训练池构成：正样本数 = {len(df_pos)}，合规负样本数 = {len(df_neg)}")
+
+df_train_pool = (
+    pd.concat([df_pos, df_neg])
+    .sample(frac=1, random_state=RANDOM_STATE)
+    .reset_index(drop=True)
+)
+
+X = df_train_pool[feature_cols]
+y = df_train_pool[TARGET_COL]
+
+print(f"\n抽样后训练特征维度: {X.shape}")
+print(f"标签 '{TARGET_COL}' 分布 -> 正样本: {y.sum()} ({y.mean():.2%}), 负样本: {(y == 0).sum()}")
+
+
+# ============================================================
+# 第四步：划分数据集 & 引入 SMOTE 过采样
+# ============================================================
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=TEST_SIZE, random_state=RANDOM_STATE, stratify=y
+)
+
+print("\n正在对训练集应用 SMOTE 过采样，平衡违规与合规样本分布...")
+smote = SMOTE(random_state=RANDOM_STATE)
+X_train_resampled, y_train_resampled = smote.fit_resample(X_train, y_train)
+
+rf_model = RandomForestClassifier(
+    n_estimators=200,
+    max_depth=20,
+    min_samples_split=4,
+    min_samples_leaf=2,
+    max_features='sqrt',
+    class_weight='balanced',
+    random_state=RANDOM_STATE,
+    n_jobs=-1
+)
+rf_model.fit(X_train_resampled, y_train_resampled)
+
+
+# ============================================================
+# 第五步：输出特征权重表
+# ============================================================
+feature_weight_df = pd.DataFrame({
+    "特征名称": feature_cols,
+    "重要性权重": rf_model.feature_importances_
+}).sort_values("重要性权重", ascending=False).reset_index(drop=True)
+feature_weight_df.insert(0, "排名", feature_weight_df.index + 1)
+
+feature_weight_df.to_excel("./feature_importance_weight.xlsx", index=False)
+print("\n✅ 完整特征权重表已成功保存至: './feature_importance_weight.xlsx'")
+
+
+# ============================================================
+# 第六步：PR 曲线寻优阈值、模型评估与正方形 ROC 曲线绘制
+# ============================================================
+y_pred_proba = rf_model.predict_proba(X_test)[:, 1]
+
+# 【新增】保存测试集真实标签 y_test 及预测为正类的概率值 y_pred_proba
+model_evaluation_results = pd.DataFrame({
+    'y_true': y_test.values,
+    'y_pred_proba': y_pred_proba
+})
+model_evaluation_results.to_excel("./data/rf.xlsx", index=False)
+print("✅ 测试集真实标签 y_true 及预测概率 y_pred_proba 已成功保存至: './data/rf.xlsx'")
+
+precisions, recalls, thresholds = precision_recall_curve(y_test, y_pred_proba)
+f1_scores = 2 * (precisions * recalls) / (precisions + recalls + 1e-10)
+best_index = np.argmax(f1_scores)
+best_threshold = thresholds[best_index]
+best_f1 = f1_scores[best_index]
+
+print(f"\n最优分类阈值: {best_threshold:.4f} (对应最高 F1: {best_f1:.4f})")
+
+y_pred_opt = (y_pred_proba >= best_threshold).astype(int)
+
+roc_auc = roc_auc_score(y_test, y_pred_proba)
+pr_auc = average_precision_score(y_test, y_pred_proba)
+
+metrics = {
+    "优化后分类阈值": best_threshold,
+    "准确率 (Accuracy)": accuracy_score(y_test, y_pred_opt),
+    "精确率 (Precision)": precision_score(y_test, y_pred_opt, zero_division=0),
+    "Recall": recall_score(y_test, y_pred_opt, zero_division=0),
+    "F1 Score": f1_score(y_test, y_pred_opt, zero_division=0),
+    "ROC-AUC": roc_auc,
+    "PR-AUC": pr_auc,
+}
+
+print("\n" + "=" * 50)
+print(f"高性能随机森林模型评估结果 (目标标签: {TARGET_COL})")
+print("=" * 50)
+for k, v in metrics.items():
+    print(f"{k}: {v:.4f}")
+print("=" * 50)
+
+# 绘制并保存正方形比例的 ROC 曲线
+fpr, tpr, _ = roc_curve(y_test, y_pred_proba)
+
+plt.figure(figsize=(6, 6))
+plt.plot(fpr, tpr, color='darkorange', lw=2, label=f'ROC curve (AUC = {roc_auc:.4f})')
+plt.plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--', label='随机猜测')
+plt.xlim([0.0, 1.0])
+plt.ylim([0.0, 1.0])
+plt.xlabel('假正例率 (False Positive Rate)', fontsize=11)
+plt.ylabel('真正例率 (True Positive Rate)', fontsize=11)
+plt.title('随机森林ROC曲线', fontsize=13, fontweight='bold')
+plt.legend(loc="lower right", fontsize=10)
+plt.grid(alpha=0.3)
+plt.tight_layout()
+
+roc_output_path = "./data/rf_roc_curve_result.png"
+plt.savefig(roc_output_path, dpi=300, bbox_inches='tight')
+print(f"✅ 随机森林正方形 ROC 曲线图已成功保存至: '{roc_output_path}'")
+plt.close()
+
+
+# ============================================================
+# 【新增】SHAP 特征解释分析模块（仅输出两张图）
+# ============================================================
+import shap
+
+print("\n" + "=" * 50)
+print("SHAP 特征解释分析")
+print("=" * 50)
+
+# ① 特征标签中英文对照表（A 编号 + 英文简称 → 中文名）
+FEATURE_CN_MAP = {
+    'A01': '两职合一', 'A02': '股权性质', 'A03': '董事会规模',
+    'A04': '股权制衡度', 'A05': '两权分离', 'A06': '独立董事比例',
+    'A07': '机构投资者持股比例', 'A08': '高管薪酬', 'A09': '总资产收益率',
+    'A10': '净资产收益率', 'A11': '营业净利率', 'A12': '总资产增长率',
+    'A13': '净利润增长率', 'A14': '营业收入增长率', 'A15': '应收账款周转率',
+    'A16': '应付账款周转率', 'A17': '固定资产周转率', 'A18': '总资产周转率',
+    'A19': '财务杠杆', 'A20': '经营杠杆', 'A21': '资产负债率',
+    'A22': '流动比率', 'A23': '速度比率', 'A24': '利息保障倍数',
+    'A25': '权益乘数', 'A26': '托宾Q值', 'A27': '上市年限',
+    'A28': '是否变更审计机构', 'A29': '审计费用', 'A30': '是否四大审计',
+    'A31': '审计意见',
+    'Dual': '两职合一', 'SOE': '股权性质', 'Board': '董事会规模',
+    'Balance3': '股权制衡度', 'Seperate': '两权分离', 'Indep': '独立董事比例',
+    'INST': '机构投资者持股比例', 'TMTPay2': '高管薪酬', 'ROA': '总资产收益率',
+    'ROE': '净资产收益率', 'NetProfit': '营业净利率', 'AssetGrowth': '总资产增长率',
+    'NetProfitGrowth': '净利润增长率', 'Growth': '营业收入增长率', 'ART': '应收账款周转率',
+    'APT': '应付账款周转率', 'FAT': '固定资产周转率', 'ATO': '总资产周转率',
+    'FL': '财务杠杆', 'OL': '经营杠杆', 'Lev': '资产负债率',
+    'Liquid': '流动比率', 'Quick': '速度比率', 'ICR': '利息保障倍数',
+    'EM1': '权益乘数', 'TobinQ': '托宾Q值', 'ListAge': '上市年限',
+    'AuditSame': '是否变更审计机构', 'AuditFee': '审计费用', 'Big4': '是否四大审计',
+    'Opinion': '审计意见',
+}
+
+def _to_cn_label(col):
+    """将特征列名映射为中文标签（兼容 A 编号 / 英文简称 / 带编号前缀的列名）"""
+    key = str(col).strip()
+    if key in FEATURE_CN_MAP:
+        return FEATURE_CN_MAP[key]
+    for k, v in FEATURE_CN_MAP.items():
+        if k.lower() == key.lower():
+            return v
+    upper = key.upper()
+    for a in range(1, 32):
+        tag = f'A{a:02d}'
+        if upper.startswith(tag):
+            return FEATURE_CN_MAP.get(tag, key)
+    return key
+
+feature_names_cn = [_to_cn_label(c) for c in feature_cols]
+
+# ② 树模型用 TreeExplainer（精确且快）
+explainer = shap.TreeExplainer(rf_model)
+
+# ③ 关键：SHAP 必须基于【原始测试集 X_test】解释，绝不能用 SMOTE 过采样集
+shap_values = explainer.shap_values(X_test)
+
+# ④ 二分类兼容性处理
+if isinstance(shap_values, list):
+    sv_pos = shap_values[1]
+elif shap_values.ndim == 3:
+    sv_pos = shap_values[..., 1]
+else:
+    sv_pos = shap_values
+
+# ── 图1：全局特征重要性（条形图）─────────────────────────────
+shap.summary_plot(sv_pos, X_test, feature_names=feature_cols,
+                  plot_type="bar", show=False)
+plt.title('SHAP 特征重要性（全局）', fontsize=13, fontweight='bold')
+plt.tight_layout()
+plt.savefig('./data/shap_importance_bar.png', dpi=300, bbox_inches='tight')
+plt.close()
+print("✅ 图1 SHAP 全局特征重要性条形图 -> './data/shap_importance_bar.png'")
+
+# ── 图2：蜜蜂图（中文标签、无标题、坐标轴中文）──────────────
+shap.summary_plot(sv_pos, X_test, feature_names=feature_names_cn, show=False)
+ax = plt.gca()
+ax.set_xlabel('SHAP 值', fontsize=11)
+ax.grid(True, linestyle='--', linewidth=0.8, alpha=0.4)
+cb_ax = plt.gcf().axes[-1]
+cb_ax.set_ylabel('特征取值', fontsize=11)
+for _lab in cb_ax.get_yticklabels():
+    _txt = _lab.get_text()
+    if _txt == 'High':
+        _lab.set_text('高')
+    elif _txt == 'Low':
+        _lab.set_text('低')
+plt.tight_layout()
+plt.savefig('./data/shap_beeswarm.png', dpi=300, bbox_inches='tight')
+plt.close()
+print("✅ 图2 SHAP 蜜蜂图 -> './data/shap_beeswarm.png'")
+
+
+# ============================================================
+# 第七步：案例公司样本外盲测
+# ============================================================
+if df_case.empty:
+    print(f"\n警告：未找到股票代码为 '{TARGET_SYMBOL}' 的公司，请检查 Symbol 或原始表格！")
+else:
+    print(f"\n成功锁定目标案例公司 ({TARGET_SYMBOL})，共 {df_case.shape[0]} 个年度样本（未参与训练）。")
+
+    X_case = df_case[feature_cols]
+    df_case['Predicted_Risk_Probability'] = rf_model.predict_proba(X_case)[:, 1]
+    df_case['Model_Predicted_Label'] = (
+        df_case['Predicted_Risk_Probability'] >= best_threshold
+    ).astype(int)
+
+    name_col = next((c for c in ['证券简称', 'ShortName'] if c in df_case.columns), None)
+    display_cols = ['Symbol'] + ([name_col] if name_col else []) + ['Year', 'Predicted_Risk_Probability', 'Model_Predicted_Label', 'Y1', 'Y2']
+    df_case_sorted = df_case[display_cols].sort_values('Year')
+
+    print("\n" + "=" * 80)
+    print(f"目标案例企业 ({TARGET_SYMBOL}) 历年内控风险穿透盲测报告（高性能优化版）")
+    print("=" * 80)
+    print(df_case_sorted.to_string(index=False))
+    print("=" * 80)
+
+    print("\n【个案逐年穿透盲测结果与隐瞒行为深度解读】")
+    for _, row in df_case_sorted.iterrows():
+        yr = int(row['Year'])
+        prob = row['Predicted_Risk_Probability']
+        pred_lbl = int(row['Model_Predicted_Label'])
+        y1_val = int(row['Y1'])
+        y2_val = int(row['Y2'])
+
+        if y1_val == 0 and y2_val == 1:
+            disclosure = "【虚假陈述/选择性隐瞒：自评无缺陷，实则被监管处罚】"
+        elif y1_val == 1 and y2_val == 1:
+            disclosure = "【相对坦诚：自评有缺陷，且被监管证实】"
+        else:
+            disclosure = "【真实合规】"
+
+        warning = "【高危预警：模型成功穿透伪装】" if pred_lbl == 1 else "【模型预测合规】"
+
+        print(f"• {yr}年度: 预测缺陷概率 = {prob:.4f} (阈值: {best_threshold:.4f}) | "
+              f"模型判定: {warning}")
+        print(f"  对照组: 企业自述(Y1) = {y1_val} | 监管纠偏(Y2) = {y2_val} {disclosure}\n")
+
+
+# ============================================================
+# 第八步：计算并导出训练样本在 2017-2025 各年份的每列特征平均值
+# ============================================================
+print(f"\n正在计算训练样本各年份的特征平均值...")
+
+df_train_yearly_mean = df_train_pool.groupby('Year')[feature_cols].mean().reset_index()
+df_train_yearly_mean = df_train_yearly_mean.sort_values('Year').reset_index(drop=True)
+
+benchmark_output_path = "./data/train_samples_yearly_benchmark_means.xlsx"
+df_train_yearly_mean.to_excel(benchmark_output_path, index=False)
+
+print(f"✅ 2017-2025 年度特征平均值基准表已成功导出！")
+print(f"• 保存路径: {benchmark_output_path}")
+print(f"• 表格维度 (年份数, 特征数+1): {df_train_yearly_mean.shape}")
+print("=" * 80)
